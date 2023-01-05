@@ -1,0 +1,810 @@
+---
+title: "Thinking Inside the Polygon: Least-Cost Path Analysis and Polygon-Bounded
+  Lines to Calculate 'As the Boat Travels' and Fetch Distances inside of Lakes Using
+  R"
+author: 'Author: Alex Bajcz, PhD'
+subtitle: 'Also: Using These Same Approaches to Try to Measure Gerrymandering!'
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+    theme: readable
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+<br>
+
+<style type="text/css">
+  body{
+  font-size: 14pt;
+}
+code{
+font-size: 14pt;
+}
+pre {
+font-size: 14pt;
+}
+</style>
+
+```{r global settings, echo = F}
+knitr::opts_chunk$set(fig.align = "center", fig.width = 8, fig.height = 6, out.width = "65%", tidy.opts = list(width.cutoff = 60), tidy = FALSE) 
+```
+
+## Acknowledgements
+
+<br>
+
+Before I begin, for this article, I owe a __big__ thanks to both [Jindra Lacko](https://www.jla-data.net/) and [Hugh Allen](https://www.researchgate.net/profile/Hugh-Allan), who provided a lot of the base code I have adapted here to my questions on Stack Exchange! For more info from them on these specific topics, see [here](https://stackoverflow.com/questions/68596244/can-i-bound-an-st-distance-call-by-a-polygon/72166057?noredirect=1#comment127583051_72166057) and [here](https://stackoverflow.com/questions/71240972/how-can-i-draw-a-line-from-a-point-to-a-polygon-edge-and-then-get-the-lines-len).
+
+<br>
+
+## Preamble
+
+<br>
+
+We'll prepare our code here by loading packages and such. The code in this lesson requires just four packages, shown below, as well as a set of spatial polygons, such as lakes--here, I use some of Minnesota's lake polygons, downloaded from the Minnesota Department of Natural Resources website here: [DNR Hydrography Water Features Polygons](https://resources.gisdata.mn.gov/pub/gdrs/data/pub/us_mn_state_dnr/water_dnr_hydrography/metadata/dnr_hydrography_all_water_features.html). Unless you're *very* curious about how this all works, you can skim the code below once you note which packages we need: `sf`, `dplyr`, `terra`, and `ggplot2`. *Throughout, whenever I show code, if the code requires functions (besides pipes) from any of these four packages, I will highlight this using package::function format.* One other note--this lesson isn't designed to cover any of the core concepts of spatial analysis, such as what a [CRS](https://en.wikipedia.org/wiki/Spatial_reference_system) is. A fantastic reference on the subject, if you want to know more, can be found [here](https://geocompr.robinlovelace.net/index.html).  
+
+<br>
+
+```{r preamble code, message=FALSE, warning=FALSE}
+#Control randomness by setting a seed
+set.seed(475) #My lucky number!
+
+#Load necessary packages
+library(sf) #For working with shape files and other spatial data
+library(ggplot2) #For nice graphics
+library(dplyr) #For pipes and data manipulation verbs
+library(terra) #For cost-based distances etc.
+
+#Load in the lake polygons of 10 Minnesota lakes--I've pre-saved just the first ten lakes that load in this file to save knitting time, then I load them below. 
+
+# MN_lakes =
+#   sf::st_read("H:/My Drive/UMN/UMN/AIS project folder/Geospatial stuff/dnr_hydro_features_all.shp") %>%
+#   dplyr::filter(!is.na(dowlknum)) %>%  #Only keep lakes that have DOW numbers from the MN DNR (aka "true lakes")
+#   dplyr::slice_head(n = 10) #Keep just the first ten lakes for ease
+# dput(MN_lakes, "MN_lakes10")
+
+MN_lakes = dget("https://raw.githubusercontent.com/BajczA475/random-data/main/MN_lakes10")
+
+#Put the lakes object in the proper CRS
+MN_lakes = sf::st_transform(MN_lakes, crs = 26915)
+
+#Make the object a "simple features" (sf) data frame object
+MN_lakes = sf::st_as_sf(MN_lakes)
+
+```
+
+<br>
+
+## Unpacking: Why Would We Want to Measure Distances Inside of Lakes?
+
+<br>
+
+Now, suppose you know of a lake...
+
+<br>
+
+```{r pic chunk 1, echo = F, fig.align = 'center'}
+knitr::include_graphics("lakepic1.jpg")
+```
+
+<br>
+
+And you know of an [aquatic invasive species](https://www.invasivespeciesinfo.gov/aquatic) that's been newly discovered in that lake...
+
+<br>
+
+```{r pic chunk 2, echo = F, fig.align = 'center'}
+knitr::include_graphics("starrypic1.jpg")
+```
+
+<br>
+
+And you know of a boat launch at that lake...
+
+<br>
+
+```{r pic chunk 3, echo = F, fig.align = 'center'}
+knitr::include_graphics("launchpic1.jpg")
+```
+
+<br>
+
+And you've observed that that same new invasive species has been showing up on boats coming into that launch lately...
+
+<br>
+
+```{r pic chunk 4, echo = F, fig.align = 'center'}
+knitr::include_graphics("boatpic1.jfif")
+```
+
+<br>
+
+When you put all these facts together, you *might* reasonably start to predict that proximity to boat launches increases the probability a spot in a lake gets infested. But how would we calculate those distances to test this hypothesis? It's not *necessarily* as easy as it sounds, as I found out!
+
+<br>
+
+## Meeting our Lake, Sample Points, and Boat Launch
+
+<br>
+
+For most of the rest of the two "halves" of this lesson, we'll use just one of the lakes in our file, Edgerton Pond in Pipestone County, MN, as an example...
+
+<br>
+
+```{r Edgerton, fig.align = 'center'}
+Edgerton = MN_lakes[4,] #This one is Edgerton
+
+#Make a custom theme for all our graphics moving forward:
+Alex_theme = ggplot2::theme(axis.text = ggplot2::element_text(size=12),
+        panel.background = ggplot2::element_rect(fill="white"), 
+        panel.grid = ggplot2::element_line(color="black"),
+        axis.text.x = ggplot2::element_text(angle = 90))
+
+ggplot2::ggplot() + 
+  ggplot2::geom_sf(data = Edgerton$geometry) + #Programming note: You have to supply data to geom_sf every time, and if you want it to plot just the polygon, you must specifically select the geometry column as your data.
+  Alex_theme 
+```
+
+<br>
+
+My reason for selecting Edgerton is that it is a good example of an important phenomenon--lakes can have __strange__ shapes! In this *particular* case, Edgerton is shaped like a bean, with two sort of bays in the north and west. To see why this shape is important, let's take a sample of 100 random points inside of this lake's polygon (i.e., its "silhouette" or boundary)--these will be our "sample locations" that we're going to "study." We'll also make one of them the location of the lake's one boat launch (I actually don't know offhand if Edgerton really has a boat launch or not or, if it does, where it is, so we're just pretending here).
+
+<br>
+
+```{r sample points and launch, fig.align = 'center'}
+#Take 100 random points from within Edgerton's polygon. 
+rand.ptsEdgerton = sf::st_sample(Edgerton, 
+                                 size = 100, 
+                                 type = 'random', 
+                                 exact = TRUE) #Forces *exactly* 100 points get drawn. Otherwise, it can fluctuate.
+
+#We'll designate point 18 as our boat launch because it illustrates the challenge here better than most. So we'll really have only 99 sample points, and that's ok!
+boat.launch = rand.ptsEdgerton[18]
+rand.ptsEdgerton = rand.ptsEdgerton[-18]
+
+ggplot2::ggplot() + 
+  ggplot2::geom_sf(data = Edgerton$geometry) +
+  ggplot2::geom_sf(data = rand.ptsEdgerton, color = "blue", size = 2) +
+  ggplot2::geom_sf(data = boat.launch, color = "red", size = 4) + #The boat launch is located in the west bay, somewhat close to the "armpit" of the "bean." 
+  Alex_theme
+```
+
+<br>
+
+## Calculating Straight-line Distances Inside Lakes
+
+<br>
+
+Recall: Our hypothesis was that because invasives are introduced into new lakes by hitching rides on boats, locations in a lake that are physically closer to a boat launch, where boats *first* enter the lake and could drop off invasive chunks, should be more likely to be infested. To test this idea, we'll need to measure the distance between our boat launch and each sample point.
+
+<br>
+
+There's just one __big__ problem: *Straight-line distances, though __very__ easy to calculate using the tools in the `sf` package, won't work here.* Why not? __Let's find out!__
+
+<br>
+
+```{r straight line distances, fig.align = 'center'}
+#Using sf's functions, calculating straight-line distances between points is a snap!
+dists2pts = sf::st_distance(boat.launch, rand.ptsEdgerton) #First argument is "from" and the second is "to," basically!
+
+dists2pts[1:6] #What these look like.
+
+#Let's draw a line between the boat launch and all our sample points to envision these straight-line distances better. This requires a bit of code...
+lines2graph = sf::st_linestring() #Storage object to hold results.
+
+#For every sample point, we need to create a matrix of X-Y coordinates for the start of the line (the boat launch) and the end of the line (the sample point), then draw a line between each starting point and ending point. We then string all these lines together (pun intended) into one object and put it in the same CRS as our lake polygon. That's all this code block below does--let your eyes glaze over here if you need to, and just know that this'll all be worth it!
+for(i in 1:length(rand.ptsEdgerton)) {
+linei = sf::st_linestring(
+  matrix(c(
+    sf::st_coordinates(boat.launch),
+    sf::st_coordinates(rand.ptsEdgerton[i])
+         ), nrow=2, byrow=T)
+)
+lines2graph = sf::st_union(lines2graph, linei)
+}
+
+lines2graph = sf::st_sfc(lines2graph, crs = sf::st_crs(Edgerton))
+
+#Now we can graph those lines!
+ggplot2::ggplot() + 
+  ggplot2::geom_sf(data = Edgerton$geometry) +
+  ggplot2::geom_sf(data = lines2graph, color = "purple") +
+  ggplot2::geom_sf(data = rand.ptsEdgerton, color = "blue", size = 2) +
+  ggplot2::geom_sf(data = boat.launch, color = "red", size = 4) + 
+  Alex_theme
+```
+
+<br>
+
+Thanks to this graph, the problem with straight-line distances hopefully leaps right out (of the lake) at you! Many of the lines connecting the boat launch to the sample points in the north bay cross right over the peninsula separating the two regions.
+
+<br>
+
+Now, unless you've got yourself an "amphibious boat"...
+
+<br>
+
+```{r pic chunk 5, echo = F, fig.align = 'center'}
+knitr::include_graphics("landboat1.webp")
+```
+
+<br>
+
+It's *probably* not *super* realistic or meaningful to calculate our distances in a way that includes land, as though a boat towing invasive propagules hopped up and over land before re-entering the waterbody to dump off those propagules into the lake on the other side!
+
+<br>
+
+And Edgerton Pond isn't even an "extreme" case by any stretch of the imagination. Many lakes have *very* complex shapes that would make these straight-line calculations of distances between sample locations and a boat launch *far* more problematic than they are here. Just take Lake Minnetonka here in Minnesota as one example...This is __really__ just *one* lake!
+
+<br>
+
+```{r pic chunk 5.5, echo = F, fig.align = 'center'}
+knitr::include_graphics("minnetonka.png")
+```
+
+<br>
+
+So, we're going to need a better way of calculating these distances!
+
+<br>
+
+## Calculating "As the Boat Travels" Distances Inside Lakes
+
+<br>
+
+What we *really* want is what our team has dubbed "as the fish swims" or "as the boat travels" distances--distances that represent the shortest viable path between two points that falls **entirely** within a constraining polygon (here, the lake's polygon). In other words, we do want to move as directly between A and B as we can when measuring the distance between them, but as soon as we *would* cross land in the process, we need to instead find the shortest "bendy" path that allows us to resume our journey from A towards B, a path that stays entirely in the water.
+
+<br>
+
+Here, we can take advantage of a technique called __"least-cost path analysis."__ That probably sounds scary, but maybe it shouldn't! Least-cost path analysis re-imagines the world as a grid of cells (think the spaces on a large tic-tac-toe or Sudoku board)...
+
+<br>
+
+```{r pic chunk 6, echo = F, fig.align = 'center'}
+knitr::include_graphics("boardpic1.jpg")
+```
+
+<br>
+
+Points of interest, like our boat launch and our sample points, are thought of as living within specific cells of the grid. As we move from the cell containing point A to the cell containing point B, we create a path that goes from the center of one cell to the center of another. Each cell we enter along our path has an assigned "cost" we must "pay" to enter it. So, as we travel through the grid, we rack up a "bill," so to speak! The goal (usually) is to find the path from A to B whose final bill is lowest, which a computer can find __shockingly__ quickly using search algorithms, even if the grid is __huge!__
+
+<br>
+
+```{r pic chunk 7, echo = F, fig.align = 'center'}
+knitr::include_graphics("leastcost1.png")
+```
+
+<br>
+
+If that all makes sense to you, hopefully you are *beginning* to see how we can get "as the boat travels" distances using least-cost path analysis! We just need to turn our lake (and the land around it) into a grid of cells, then make the cost to travel through any non-lake cell *so* prohibitively high that any path containing even one non-lake cell is **never** best. We also need to make traveling through every lake cell cost the same so that it's never somehow "cheaper" to travel a longer path through the lake than a shorter one. Let's see these ideas in action!
+
+<br>
+
+```{r rasterizing, fig.align = 'center'}
+#Step 1 -- Capture the "extent" of our lake polygon. This is like drawing a giant "box" around our lake, one that would fully encompass it.
+
+current.raster = terra::ext(Edgerton)
+
+plot(current.raster) #There's our box, within which Edgerton Pond would fully fit. This is the box we will partition into a grid of cells in the next step.
+
+#Step 2 -- "Rasterize" our box. This code will break our box into 1000x1000 cells, each holding a cost value of 1 to start. We can associate a CRS with this grid so that R knows how much area each cell represents IRL. 
+current.raster = terra::rast(current.raster,
+                             nrow=1000, ncol=1000, 
+                             crs = crs(Edgerton), 
+                             vals = 1)
+
+plot(current.raster) #The entire box is now a value of 1, as the legend suggests.
+
+#Step 3 -- Differentiate land from non-land. Here, we make a "mask" of the lake (a vector of the cells that correspond to where the edge of the lake polygon is). We then update everything to the outside of the mask to have a cost value of NA. It's like saying these cells are so non-viable they can't even have a cost, which means a path will definitely never include them!
+current.raster = terra::mask(current.raster, 
+                      terra::vect(Edgerton),
+                      updatevalue = NA)
+
+plot(current.raster) #We've just "carved" Edgerton Pond back out of the block we had created earlier, like carving a statue from a block of marble! 
+
+#Step 4 -- Demarcate the cells containing points of interest. We need to know which cells hold our sample points and which one holds our boat launch, which we can figure out using the cellFromXY function
+point.locs = terra::cellFromXY(current.raster,
+                        sf::st_coordinates(rand.ptsEdgerton))
+launch.loc = terra::cellFromXY(current.raster, 
+                        sf::st_coordinates(boat.launch))
+
+point.locs[1:5] #Cell position numbers of the first 5 sample points in our giant 1000x1000 grid.
+
+#Step 5 -- Mark our boat launch as "special." Since we want to calculate the distance from our boat launch to every other point, we can make our lives easy by marking our boat launch as special in our grid by giving it a unique cost value. Here, we'll make it a 2. 
+terra::values(current.raster)[launch.loc] = 2
+
+which(terra::values(current.raster) == 2) #Confirms we were successful in making a cell somewhere a cost value of 2!
+```
+
+<br>
+
+We're now ready to calculate our "bendy" distances through the lake! Because our problem is *so* simple (for a computer, anyway!), we can calculate the least-cost path distances between the boat launch cell and **every other cell** in the *entire* lake (not just the cells containing our sample points) in the blink of an eye!
+
+<br>
+
+```{r curvy dists, fig.align = 'center'}
+#Step 6 -- Get the distances of our least-cost paths from every cell that isn't NA to all cells holding the "target" value, here 2 to designate our boat launch as the target. After all, calculating the distances *from* each point *to* the boat launch is the same thing as doing the reverse...
+all.dists = terra::gridDist(current.raster, 
+                         target = 2)
+
+#This is what all these distance values look like, now that we have one for every single cell in the lake! Oooh la la!
+plot(all.dists)
+
+#The all.dists object now holds the distance from every cell to the boat launch...
+terra::values(all.dists)[696:716]
+
+#We can get just the distances were interested in by specifying which cells our sample points were in.
+pt.dists = terra::values(all.dists)[point.locs]
+
+pt.dists[1:5]
+
+```
+
+<br>
+
+How do our "as the boat travels" distances compare with our straight-line distances? Below, I'll plot our "as the boat travels" distance values for every sample point on the X axis and our "straight-line" distances for every sample point on the Y axis. I'll also plot a 1:1 line--if the two distances are __exactly__ the same for a given sample point, that point's dot on this scatterplot will be smack dab on the 1:1 line. If the "curvy" distance is larger, the dot will instead be under the 1:1 line, and *vice versa*.
+
+<br>
+
+```{r comparing our two sets of differences, fig.align = 'center'}
+plot(dists2pts[1,] ~ pt.dists, 
+     xlab = "Curvy Distances",
+     ylab = "Straight Distances"); abline(0, 1)
+```
+
+<br>
+
+As you can hopefully see, in general, the two sets of distances are *very* similar. However, for the majority of sample points, the "as the boat travels" distances are a *little* longer (i.e., they fall below the 1:1 line). Why is that? Well, there are two main reasons:
+
+1.  For many of the points that lie in the north bay, on the other side of the peninsula from the boat launch, our "as the boat travels" paths have to wrap around the peninsula to reach those points instead of going over land, which makes the bendy distances longer than the straight-line ones (an intended outcome!).
+2.  Instead of being able to take the *absolute most direct path* between our two points of interest, our "as the boat travels" paths have to go through the __centers__ of cells (this is mentioned in the help file for the gridDist function!), which can make the paths *ever so slightly* inefficiently long (an unintended outcome!). This inefficiency can be reduced by increasing the number of cells you break your grid into, although this can make the whole process slower if you take it too far. In any case, the distortion caused by this should usually be very small.
+
+<br>
+
+## Least-cost Path Analysis and Gerrymandering?!
+
+<br>
+
+While there are __many__ uses that I know of for least-cost path analysis in my home discipline of Ecology, I'd imagine it would be a useful approach in just about any discipline that has spatial extents (polygons) that represent hard-and-fast boundaries for processes, *especially* those that can take strange shapes. And when I think strangely shaped polygons, being the politics nerd that I am, I instinctively think: __US Congressional districts!__ You can download shape files for the districts used in the elections for every Congress up until 2017 [on this website](https://cdmaps.polisci.ucla.edu/). Here, I've downloaded the ones for the 114th Congress, which served from 2015-2017. 
+
+<br>
+
+```{r congressional districts, message=FALSE, warning=FALSE}
+congress = sf::st_read("districtShapes/districts114.shp", quiet = TRUE)
+
+#Let's pull and plot Texas's Congressional districts from this period
+texas = congress %>% 
+  dplyr::filter(STATENAME == "Texas")
+
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = texas$geometry) +
+  Alex_theme
+```
+
+<br>
+
+Gerrymandering is the process of drawing congressional districts with the intent of creating a set of districts somehow more favorable overall for your political party. *Usually,* to gerrymander a district really effectively, you need to make a district look __really__ strange. This is because you need to ensure it includes a lot more of your voters (or a lot more of your opponent's voters, depending on how you're doing it), wherever those voters might live, than it otherwise would. This often means snaking around to "pick up" pockets of specific voters here and there, leading to long, narrow, and "snaky" districts instead of districts that are more blobby or square. Compare the actual congressional districts (as of 2016) to ones designed by a computer to optimally pack neighbors (regardless of how they vote) into the same district using the two maps below and you might get a sense of what I mean.
+
+<br>
+
+```{r pic chunk 7.5, echo = F, fig.align = 'center'}
+knitr::include_graphics("mapcompare1.webp")
+```
+
+<br>
+
+Here's what I'm thinking (as a non-political scientist!): *Maybe* we can use our least-cost path analysis approach to explore how gerrymandered districts in Texas were in 2015-2017! As I mentioned earlier, *in general*, the longer, skinnier, and snakier a district is, the more likely it is to be the result of gerrymandering (at least, that's my understanding!). So, we might ask: In a given district, if I find the maximum straight-line distance between two points and I also find the maximum "bendy-line" distance between two points and I compare these two distances, how similar are they? If a district is __really__ bendy, the max bendy-line distance should be __much__ longer than the max straight-line distance. That's my logic, anyway! Let's find out if that's true or not...
+
+<br>
+
+```{r Texas explorations}
+#Set up some storage objects for our two sets of distances.
+longest.dist.district.straight = rep(NA, 36)
+longest.dist.district.curved = rep(NA, 36)
+
+#We're going to do this one district at a time.
+for(c in 1:36) { #Texas had 36 districts.
+  #if(c %% 3 == 0) {print(c)} #Optional progress bar.
+  
+  this.district = texas[c, ] #Pull out the current district to work with
+  
+  #We'll get a sample of 100 randomly placed sample points within the district's polygon.
+  rand.ptsDistrict = sf::st_sample(this.district, 
+                                 size = 100, 
+                                 type = 'random', 
+                                 exact = TRUE)
+  
+  #What's the max straight-line distance between any two points in our sample (ignoring the bounding polygon entirely)?
+  longest.dist.district.straight[c] = max(sf::st_distance(rand.ptsDistrict))
+  
+#Now, we calculate our 'as the campaigning politician would drive' distances. We need to do this for each of our 100 points separately, with each as the target point in turn, and save the longest such value we get...This code is largely the same as the code earlier--just some tweaks here and there!
+  current.raster = terra::ext(this.district)
+  current.raster = terra::rast(current.raster,
+                             nrow=100, ncol=100, 
+                             crs = crs(this.district), 
+                             vals = 1)
+  current.raster = terra::mask(current.raster, 
+                      terra::vect(this.district),
+                      updatevalue = NA)
+  point.locs = terra::cellFromXY(current.raster,
+                        sf::st_coordinates(rand.ptsDistrict))
+
+  longest.dists.i = rep(NA, 100)
+  for(i in 1:100) {
+  point.i.loc = cellFromXY(current.raster,
+                        st_coordinates(rand.ptsDistrict[i]))
+  point.noni.loc = cellFromXY(current.raster,
+                        st_coordinates(rand.ptsDistrict[-i]))
+  terra::values(current.raster)[point.i.loc] = 2
+  all.dists = terra::gridDist(current.raster, 
+                         target = 2, scale = 1)
+  longest.dists.i[i] = max(values(all.dists)[point.noni.loc], na.rm=TRUE)
+  terra::values(current.raster)[point.i.loc] = 1
+  }
+  
+  longest.dist.district.curved[c] = max(longest.dists.i)
+  
+}
+```
+
+<br>
+
+We can now compare the two sets of distances we've retrieved--how much longer are the longest curvy paths between points in a district than the longest straight-line paths? By what percentage? And how valid is my idea to use these differences as a crude measure of how gerrymandered a district might be?
+
+<br>
+
+```{r comparing the curvy and straight line distances, message=FALSE, warning = FALSE}
+library(viridis) #For color-blind-friendly color palettes. Not required, but nice!
+
+#Here's a comparison of our two sets of differences, with a percentage difference (how much bigger is the curved difference as a %) in the third column. Units of distances are in meters, which is why the numbers are so large.
+dist.comparisonDF = round(data.frame(straight.dists = longest.dist.district.straight, 
+       curved.dists = longest.dist.district.curved,
+       percent.diff = (((longest.dist.district.curved)/longest.dist.district.straight)*100)-100), 3)
+head(dist.comparisonDF)
+
+#And here's a map of the districts filled based on those percentage differences.
+texas$gerrymander1 = as.numeric(dist.comparisonDF$percent.diff)
+ggplot2::ggplot(data = texas, aes(fill = gerrymander1)) +
+  ggplot2::geom_sf() +
+  Alex_theme +
+  viridis::scale_fill_viridis(option = "magma")
+
+```
+
+<br>
+
+In the map above, warm colors indicate districts that had a much longer max "curvy-line" distance--which we would expect to mean a more gerrymandered district. Is this measure of gerrymandering perfect? Well, clearly, no. There are some districts that are *quite* snaky to my eye that this measure doesn't seem to pick up on (e.g., district 35, the very long, small, and skinny one in the middle of the state, near Austin). Conversely, districts along state borders might be expected to be snakier nthan average just as a consequence of having to follow along snaky state borders than they otherwise would be, which this measure wouldn't give them credit for. 
+
+<br>
+
+Still, a couple of districts in the Houston area pop out as being *especially* snaky given this measure, such as District #2, with the max curvy path being ~50% longer than the max straight-line path between random points in the district. Perhaps not coincidentally, [this exact district has been called out before for being particularly gerrymandered](https://www.wired.com/2016/01/gerrymandering-is-even-more-infuriating-when-you-can-actually-see-it/). So, maybe there is something to this measure after all! And, for me, at least, this is a pretty fun application of these tools in a very different setting than I'm used to!
+
+<br>
+
+## Drawing Line Segments Inside Polygons -- Go Fetch!
+
+<br>
+
+But we're not quite done yet! There's a *second* fun thing involving distances inside of lake polygons I want to show you in this lesson. Suppose that you knew of some wavy spots in a lake...
+
+<br>
+
+```{r pic chunk 8, echo = F, fig.align = 'center'}
+knitr::include_graphics("wavypic1.jfif")
+```
+
+<br>
+
+And you also knew of some calm spots in a lake...
+
+<br>
+
+```{r pic chunk 9, echo = F, fig.align = 'center'}
+knitr::include_graphics("calmpic1.jpg")
+```
+
+<br>
+
+Over time, you start to suspect that the invasive species you're tracking prefers the calm spots over the wavy spots. How would you test this hypothesis? We'd need a measure of how (actually or theoretically) wavy a given spot in a lake was likely to be. In lake science, there is such a measure: __Fetch__. 
+
+<br>
+
+Speaking from experience, fetch is maybe not the *most* intuitive concept ever! The first key idea is that what creates waves is wind. When wind blows over the waters of a lake, the friction between the air and the water can result in the water being "pushed," creating a wave. The longer the distance that wind can push water for, the more potential for wave creation there is. That logic is where the idea of fetch comes from: A lake's fetch can be defined as the longest distance, in any direction, wind could blow in a straight line over the lake's surface uninterrupted, potentially creating waves in the process. The longer the fetch, the wavier we could expect that lake's waters to be.
+
+<br>
+
+```{r pic chunk 10, echo = F, fig.align = 'center'}
+knitr::include_graphics("fetchpic1.jpg")
+```
+
+<br>
+
+Sometimes, fetch gets "enhanced" by incorporating prevailing wind direction, depth, and other data, but we won't make it that complicated here! So, the process of calculating a lake's fetch can be as simple as trying to draw a bunch of straight lines in a lake from shoreline to shoreline and finding the longest such line!
+
+<br>
+
+While a lake can have a fetch value, a __spot__ in a lake can have a fetch value too--all we have to do is force the lines we'd draw through that spot's location instead of drawing lines all over the entire lake. Since this probably sounds like a very "brute force" way of calculating fetch (and it is), it probably sounds like a job for a computer (and it is)! There's just one *little* hurdle we'll have to clear...To see what that is, let's get ourselves set up to hunt for the fetch value of a specific point in Edgerton Pond.
+
+<br>
+
+```{r fetch setup}
+#First, let's set up a table that holds a range of bearings, going from -180 to 180 in increments of 5 degrees. -180 and 180 are the same bearing, and both are opposite from 0. -5 is opposite 175, and so on. I believe that 0 is North and 90 is East, but I'm not totally sure, and it doesn't really matter if I'm right or not--the code still works! We're not actually going to use this object much, but it's at least a handy reference.
+bearing.df = data.frame(
+  cbind(
+    bearing = seq(-180, 175, by = 5),
+    match = c(seq(0, 175, by = 5), seq(-180, -5, by = 5))))
+
+head(bearing.df)
+
+#We also need to make an object that contains the bearings we're going to try drawing lines in the direction of. We'll do 72 evenly spaced bearings because the math works out nicely. In practice, as long as you do bearings that are directly opposite one another, it should all work out fine. We'll fill the Y column with 0s--these will work to "balance" out our bearings in a way even I don't really understand...
+
+bearings.mat = data.frame(X = seq(-180, 175, length.out = 72), 
+                          Y = rep(0, 72))
+
+head(bearings.mat)
+
+#We'll find the fetch of just a single point to keep things simple--this particular point is interesting in ways that will be useful.
+point1 = rand.ptsEdgerton[88]
+
+#Let's see what we're dealing with! As you'll see below, this point is in the north bay of the lake.
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = Edgerton$geometry) +
+  ggplot2::geom_sf(data = sf::st_as_sf(point1), size = 3) +
+  Alex_theme
+
+#To work with bearings nicely, we'll transform our lake polygon and point objects into a lat-long CRS. 
+point1 = sf::st_transform(point1, crs=4326) %>% 
+  sf::st_cast("POINT")
+lake1 = sf::st_transform(Edgerton, crs=4326)
+
+#Lastly, we'll turn our point object into a set of X-Y coordinates to accommodate our coming workflow.
+point1coords = data.frame(sf::st_coordinates(point1)) 
+head(point1coords)
+```
+
+<br>
+
+What we need to do to draw all our possible fetch lines is *kinda* weird, but may eventually make sense if you think about it long enough! We need to take each of our "bearing points" we made earlier (in our `bearings.mat` object) and pair each one with our actual sample point. Then, for each of those pairings, we draw a line between them. Because we don't need our lines to extend out past our lake polygon (wind blowing over land is irrelevant for us!), every time that a given line were to cross the edge of the lake polygon, we should chop that line into subsegments so we can toss out the subsegments that go over land.
+
+<br> 
+
+Then, because we assume that wave action is halted as soon as wind were to hit land (even if it's a small piece of land that had more lake on the other side of it!), we need to keep only the one subsegment of each line that is closest to the sample point. We then have to take the lengths of all the subsegments we've drawn outward from our point and figure out which opposing __pair__ of those subsegments is the longest collective pair. This might make relatively little sense to you in words, but it will hopefully make more sense to you in pictures, which I show below!
+
+<br>
+
+```{r fetch analysis, warning=F}
+#We can make our point pairings using apply, putting each pairing into a unique slot in a list object, tmp1. 
+tmp1 = apply(bearings.mat, 1, rbind, point1coords)
+
+tmp1[[1]] #The first unit in this new object.
+
+#Next, we'll use lapply to make a linestring between every pairing. We'll also use st_intersection to find all the places where each linestring intersects the lake polygon and create subsegments at all those places.
+tmp2 = lapply(tmp1, function(x) { 
+  as.matrix(x) %>% 
+    sf::st_linestring() %>% 
+    sf::st_sfc(crs=4326) %>% 
+    sf::st_intersection(lake1) %>% 
+    sf::st_cast("LINESTRING")
+})
+
+#Let's pause to look at what we've made so far. Here's one of our linestrings coming out from our sample point--in this case, our linestring "punches through" the peninsula and re-enters the lake in the west bay. That isn't something we're going to want in this particular case, given our understanding of how fetch works...
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = lake1$geometry) +
+  ggplot2::geom_sf(data = sf::st_as_sf(point1), size = 3) +
+  ggplot2::geom_sf(data = sf::st_as_sf(tmp2[[8]]), size = 2, color = "red") +
+  Alex_theme
+
+#We can once again use lapply coupled with st_is_within_distance to figure out which subsegment in each linestring is closest to the sample point and keep just that subsegment. That will throw out that "extra" segment in the west bay for the linestring we looked at above.
+tmp3 = lapply(tmp2, function(x) { 
+  x[
+    unlist(
+      sf::st_is_within_distance(
+        sf::st_as_sf(point1, coords=c("X", "Y"), crs=4326), x, dist=1)
+      )[1]
+    ]
+})
+
+#Just to confirm we've been successful...
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = lake1$geometry) +
+  ggplot2::geom_sf(data = sf::st_as_sf(point1), size = 3) +
+  ggplot2::geom_sf(data = sf::st_as_sf(tmp3[[8]]), size = 2, color = "red") +
+  Alex_theme
+
+#Just for fun, we can visualize all 72 line prospective fetch line segments we've made! It looks like abstract art to me...
+condensed = dplyr::bind_rows(lapply(tmp3, sf::st_as_sf))
+
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = lake1$geometry) +
+  ggplot2::geom_sf(data = sf::st_as_sf(point1), size = 3) +
+  ggplot2::geom_sf(data = condensed, color = "red", size = 2) +
+  Alex_theme
+
+#We can see the lengths of these segments like so...
+round(unlist(lapply(tmp3, sf::st_length)), 3)[1:10]
+
+#Let's bind them to our bearings.mat object for convenience.
+bearings.mat$lengths = round(unlist(lapply(tmp3, st_length)),3)
+
+```
+
+<br>
+
+At this point, we have 72 line segments radiating out from our point--or, really, 36 opposing pairs of segments, representing lengths of open water that wind could blow unimpeded over without hitting any land (no matter how tiny). Which of these 36 opposing pairs of line segments is longest? That is the distance we need to find to use as this point's fetch value. To calculate these distances, we need some way of matching each line segment with the line segment from the opposing bearing. This code below would help us get there, but it actually reveals a way we can "cheat" to get there even faster, thanks to how we set all this up!
+
+<br>
+
+```{r showing that we can cheat a little}
+#Introduce a column called match that contains the opposing bearing for each row.
+bearings.mat$match = NA #Placeholder 
+for(r in 1:72) {
+  bearings.mat$match[r] = 
+    bearing.df$match[bearing.df$bearing == bearings.mat$X[r]]
+}
+
+#Here, look at rows 1-3, then rows 37-39. They show that bearings -180, -175, and -170 (rows 1-3) should match up with bearings 0, 5, and 10 (rows 37-39). So, everyone's pair in the top half of this table is exactly 36 rows below them, in the bottom half of the table!
+bearings.mat[c(1:4, 37:40),]
+
+#So, to get the combined lengths of our opposing segments, we just need to take the lengths we have in the first 36 rows and add them with the corresponding lengths in the last 36 rows. 
+final.lengths = integer(0) #Storage object
+for(r in 1:36) {
+  final.lengths[r] = bearings.mat$lengths[r] + bearings.mat$lengths[r+36]
+}
+
+final.lengths[1:10] #Some of what we've created.
+
+#Now, we just need to figure out which length is longest.
+this.seg = which(final.lengths == max(final.lengths)) #This one! Looks to be segment pair 14...
+
+bearings.mat[c(14,14+36),] #It's the segments heading along bearings -115 and 65, as it turns out.
+
+#Let's grab those two segments and put them in a special object.
+these.segs = list(tmp3[[this.seg]], tmp3[[this.seg+36]])
+
+#And let's plot the whole deal! Seems a plausible fetch line to me.
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = lake1$geometry) +
+  ggplot2::geom_sf(data = sf::st_as_sf(point1), size = 3) +
+  ggplot2::geom_sf(data = sf::st_as_sf(these.segs[[1]]), color="blue", size = 2) +
+  ggplot2::geom_sf(data = sf::st_as_sf(these.segs[[2]]), color="blue", size = 2) +
+  Alex_theme
+
+```
+
+<br>
+
+There you have it! We have a measure of fetch for a single point in a lake! One could imagine using a loop to do this approach over a whole series of points in a lake--something my research team has in fact done: Here's what that might look like for Green Lake in Wisconsin, with the colors of the dots varying according to their fetches. You can see that the fetch values are high along the "central E-W line" of the lake and get smaller as we get nearer to shore or into some of the small, isolated nooks along the shoreline. 
+
+<br>
+
+```{r pic chunk 11, echo = F, fig.align = 'center'}
+knitr::include_graphics("fetchlake1.png")
+```
+
+<br>
+
+## Fetch and Gerrymandering?!
+
+<br>
+
+Interestingly, the concept of fetch, as we have calculated it here, also seems to me to be a *possible* measure of how gerrymandered a Congressional district might be. If we pick, say, 10 random points in a district and calculate their fetches, a squarish district should have a *relatively* high average fetch value amongst those 10 points--you'll have a *lot* of room to roam out from each point (in at least two opposing directions, anyway) while remaining fully inside the district. A snaky district will have very few long, straight, and uninterrupted stretches and thus a relatively low average fetch value, by contrast. Those are my hypotheses, anyway--let's test them!
+
+<br>
+
+```{r testing ideas about fetch and gerrymandering}
+#Create storage objects for the pairs of distances we need
+longest.dist.district.straight2 = rep(NA, 36)
+district.fetches = rep(NA, 36)
+
+for(c in 1:36) { #Texas had 36 districts.
+  #if(c %% 3 == 0) {print(c)} #Optional progress bar.
+
+  this.district = texas[c, ] #Pull the current district to work with
+  
+  #Let's only do 10 random points in each district to keep this operation relatively small.
+  rand.ptsDistrict = sf::st_sample(this.district, 
+                                 size = 10, 
+                                 type = 'random', 
+                                 exact = TRUE)
+  
+  #What's the max straight-line distance between any two points in our sample? This will help us scale our results by helping us know whether we're looking at a big or a small district. Otherwise, large districts will have large average fetches simply by virtue of being larger, not because they aren't snaky!
+  longest.dist.district.straight2[c] = max(sf::st_distance(rand.ptsDistrict))
+  
+  #As before, we need to re-engineer our polygon and point data into objects based in a lat-long CRS.
+  points.i = sf::st_transform(rand.ptsDistrict, crs=4326) %>% 
+    sf::st_cast("POINT")
+  district.i = sf::st_transform(this.district, crs=4326)
+  pointsi.coords = data.frame(sf::st_coordinates(points.i)) 
+  
+  #This time, because we need to do this for 10 different points in each district, we need to loop over the points, doing each one at a time.
+  point.fetches = rep(NA, 10) #Storage object.
+  for(p in 1:10) {
+    #if(p %% 10 == 0) { print(p)} #Optional progress bar
+    
+  bearings.mat2 = bearings.mat[,1:2] #Start afresh each time. Otherwise, the rest of the code here is more or less the same as shown earlier.
+  tmp1 = apply(bearings.mat2, 1, rbind, pointsi.coords[p,])
+  tmp2 = lapply(tmp1, function(x) { 
+  as.matrix(x) %>% 
+    sf::st_linestring() %>% 
+    sf::st_sfc(crs=4326) %>% 
+    sf::st_intersection(district.i) %>% 
+    sf::st_cast("LINESTRING")
+  })
+  tmp3 = lapply(tmp2, function(x) { 
+  x[
+    unlist(
+      sf::st_is_within_distance(st_as_sf(pointsi.coords[p,], coords=c("X", "Y"), crs=4326), 
+                            x, dist=1)
+      )[1]
+    ]
+  }) 
+  bearings.mat2$lengths = round(unlist(lapply(tmp3, st_length)),3)
+  final.lengths = integer(0) 
+  for(r in 1:36) {
+  final.lengths[r] = bearings.mat2$lengths[r] + bearings.mat2$lengths[r+36]
+  }
+  this.seg = which(final.lengths == max(final.lengths))
+  point.fetches[p] = final.lengths[this.seg]
+  } #/end points loop
+  district.fetches[c] = mean(point.fetches)
+} #/end districts loop
+
+#Put the results in a data frame object.
+fetch.gerryDF = data.frame(long.dists = longest.dist.district.straight2,
+                           district.fetches = district.fetches)
+#Cache the results--no need to run this if you don't want to!
+saveRDS(fetch.gerryDF, "fetch.gerryDF")
+```
+
+```{r reloading results, echo=FALSE}
+fetch.gerryDF = readRDS("fetch.gerryDF")
+```
+
+<br>
+
+As my comment inside the code block above notes, we need to adjust our average fetch values for each district using the longest straight-line distance observed in that district. Doing so will scale our fetch values according to the size of the district. Otherwise, smaller districts would look relatively worse (i.e., have smaller average fetch lengths) just by virtue of being small!
+
+<br>
+
+```{r reloading and graphic cached results}
+#How long is the average "fetch" in a district, relative to how large that district is?
+texas$gerrymander2 = 
+  fetch.gerryDF$district.fetches/fetch.gerryDF$long.dists
+
+#Plotting the results--Here, a low value indicates a short average fetch relative to the size of the district, indicating *greater* evidence that the district is gerrymandered.
+ggplot2::ggplot(data = texas, aes(fill = gerrymander2)) +
+  ggplot2::geom_sf() +
+  Alex_theme +
+  viridis::scale_fill_viridis(option = "magma", begin = 1, end = 0) #Reverse the scale to make hot colors low values, since those are "bad" here. 
+
+```
+
+<br>
+
+How does this potential measure of gerrymandering do? Well, it's a little hard to say because most of Texas's districts are pretty snaky! That said, the far-west district is by far the square-est district, and it gets the highest (best) score here, as we might expect. There are other *relatively* compact districts in the center and northeast regions of the state that also come back in cool colors. Meanwhile, most of the __really__ visibly twisty districts come back in hot colors, including ones that weren't coming back as such with our first measure. One reason this measure might be more "successful" than our last is that it punishes both twistiness _and_ narrowness, whereas our first measure only really punished twistiness. 
+
+<br>
+
+Now, are either of these measures of gerrymandering perfect? Heavens no! For one thing, __obviously__, there could be some perfectly good reasons for a district to be narrow or twisty, especially if it follows natural dividing elements that are twisty, such as borders or rivers. However, are these measures perhaps capturing *something* about levels of gerrymandering? Well, to me, it looks like it, and I think that pretty cool!
+
+<br>
+
+So, what do you think? Do you have questions about these two approaches? Can you think of ways to apply them in your own work, or in a very different discipline than those I've explained here? Let me know!
+
+<br>
+
+## Session Information
+
+<br>
+
+See below for the info from my session, in case you need to reference this information to recreate the code I provide here. Note that I make no assurances that the code provided here is the most efficient code possible nor that the code is completely without issues!
+
+```{r, session info}
+sessionInfo()
+```
+
+
